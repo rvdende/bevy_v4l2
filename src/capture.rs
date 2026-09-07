@@ -24,6 +24,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
+use std::sync::Mutex;
 use v4l::{
     Device, FourCC,
     buffer::Type as BufType,
@@ -152,6 +153,40 @@ impl Drop for ExportedBuffer {
     }
 }
 
+/// A CPU copy of one frame's luma, for consumers that need pixels on the CPU (calibration,
+/// tracking). Produced only while at least one [`FrameTap`] exists.
+#[derive(Debug, Clone)]
+pub struct GrayFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major, tightly packed (`width * height` bytes).
+    pub data: Vec<u8>,
+    pub sequence: u32,
+    /// Driver timestamp on `CLOCK_MONOTONIC`.
+    pub timestamp: Duration,
+}
+
+/// Receiver of [`GrayFrame`]s from a [`Capture`]. Dropping it stops the copies.
+pub struct FrameTap {
+    rx: Receiver<GrayFrame>,
+}
+
+impl FrameTap {
+    /// Newest frame available, discarding older ones.
+    pub fn try_recv_latest(&self) -> Option<GrayFrame> {
+        let mut latest = None;
+        while let Ok(f) = self.rx.try_recv() {
+            latest = Some(f);
+        }
+        latest
+    }
+
+    /// Blocks up to `timeout` for the next frame. `None` on timeout or when the capture is gone.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<GrayFrame> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+}
+
 /// A frame the driver has finished writing.
 #[derive(Debug, Clone, Copy)]
 pub struct DequeuedFrame {
@@ -191,6 +226,7 @@ struct Shared {
     layout: FrameLayout,
     buffers: Vec<ExportedBuffer>,
     stop: AtomicBool,
+    taps: Mutex<Vec<Sender<GrayFrame>>>,
     flush_cpu_cache: bool,
     flush_nanos: AtomicU64,
     dequeued: AtomicU64,
@@ -199,6 +235,52 @@ struct Shared {
 }
 
 impl Shared {
+    fn has_taps(&self) -> bool {
+        !self.taps.lock().unwrap().is_empty()
+    }
+
+    fn publish(&self, frame: GrayFrame) {
+        let mut taps = self.taps.lock().unwrap();
+        taps.retain(|t| {
+            !matches!(
+                t.try_send(frame.clone()),
+                Err(TrySendError::Disconnected(_))
+            )
+        });
+    }
+
+    /// Luma of a raw 4:2:2 frame, if anyone is listening.
+    fn publish_raw(&self, frame: &DequeuedFrame) {
+        if !self.has_taps() || self.layout.compressed {
+            return;
+        }
+        let (w, h, stride) = (
+            self.layout.width as usize,
+            self.layout.height as usize,
+            self.layout.stride as usize,
+        );
+        let src = self.buffers[frame.index as usize].as_slice();
+        let y_offset = if self.layout.fourcc == FOURCC_UYVY {
+            1
+        } else {
+            0
+        };
+        let mut data = vec![0u8; w * h];
+        for (row, out) in data.chunks_exact_mut(w).enumerate() {
+            let line = &src[row * stride..row * stride + w * 2];
+            for (x, px) in out.iter_mut().enumerate() {
+                *px = line[x * 2 + y_offset];
+            }
+        }
+        self.publish(GrayFrame {
+            width: w as u32,
+            height: h as u32,
+            data,
+            sequence: frame.sequence,
+            timestamp: frame.timestamp,
+        });
+    }
+
     fn fd(&self) -> i32 {
         self.device.handle().fd()
     }
@@ -411,6 +493,7 @@ impl Capture {
             layout,
             buffers,
             stop: AtomicBool::new(false),
+            taps: Mutex::new(Vec::new()),
             flush_cpu_cache: config.flush_cpu_cache,
             flush_nanos: AtomicU64::new(0),
             dequeued: AtomicU64::new(0),
@@ -474,6 +557,46 @@ impl Capture {
         if let Err(e) = self.shared.qbuf(index) {
             tracing::error!("VIDIOC_QBUF({index}) failed: {e}");
         }
+    }
+
+    /// Subscribe to CPU copies of each frame's luma. Costs about half a millisecond per 1080p
+    /// frame on the capture thread (raw formats) or the decode thread (MJPEG) while the tap
+    /// is alive. The channel holds a few frames; slow consumers see the newest.
+    pub fn tap(&self) -> FrameTap {
+        let (tx, rx) = crossbeam_channel::bounded(3);
+        self.shared.taps.lock().unwrap().push(tx);
+        FrameTap { rx }
+    }
+
+    /// Whether any [`FrameTap`] is active. Decoders use this to skip the gray conversion.
+    pub fn has_taps(&self) -> bool {
+        self.shared.has_taps()
+    }
+
+    /// Publish luma derived from decoded RGBA (for compressed streams).
+    pub fn publish_gray_from_rgba(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        sequence: u32,
+        timestamp: Duration,
+    ) {
+        if !self.shared.has_taps() {
+            return;
+        }
+        let mut data = Vec::with_capacity((width * height) as usize);
+        data.extend(rgba.as_chunks::<4>().0.iter().map(|p| {
+            // BT.601 luma from sRGB-encoded values; good enough for corner detection.
+            ((77 * p[0] as u32 + 150 * p[1] as u32 + 29 * p[2] as u32) >> 8) as u8
+        }));
+        self.shared.publish(GrayFrame {
+            width,
+            height,
+            data,
+            sequence,
+            timestamp,
+        });
     }
 
     /// Frames dequeued so far.
@@ -549,6 +672,7 @@ fn poll_loop(shared: Arc<Shared>, tx: Sender<DequeuedFrame>) {
                             .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
                     shared.dequeued.fetch_add(1, Ordering::Relaxed);
+                    shared.publish_raw(&frame);
                     if frame.error {
                         shared.damaged.fetch_add(1, Ordering::Relaxed);
                     }

@@ -1,10 +1,10 @@
 [package]
 name = "bevy_v4l2"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-description = "Low-latency V4L2 webcam capture for Bevy: DMA-BUF zero-copy import into wgpu, GPU YUV conversion, MJPEG fallback, camera controls"
+description = "Low-latency V4L2 webcam capture for Bevy: DMA-BUF zero-copy import into wgpu, GPU YUV conversion, MJPEG fallback, camera controls, lens and rolling-shutter calibration"
 repository = "https://github.com/rvdende/bevy_v4l2"
 documentation = "https://docs.rs/bevy_v4l2"
 readme = "README.md"
@@ -19,12 +19,30 @@ default = ["dmabuf", "mjpeg"]
 dmabuf = ["dep:ash", "bevy/raw_vulkan_init"]
 ## Decode MJPEG streams on a CPU thread when only a compressed mode reaches the wanted rate.
 mjpeg = ["dep:zune-jpeg"]
+## Lens (intrinsics + Brown-Conrady distortion) and rolling-shutter calibration with a printed
+## chessboard, pure Rust.
+calibration = [
+    "dep:calib-targets",
+    "dep:vision-calibration-core",
+    "dep:vision-calibration-pipeline",
+    "dep:image",
+    "dep:nalgebra",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["bevy_asset", "bevy_render", "bevy_pbr", "bevy_image", "bevy_mesh", "bevy_shader", "bevy_log", "std"] }
 wgpu = "29"
 ash = { version = "0.38", optional = true }
 zune-jpeg = { version = "0.5", optional = true }
+calib-targets = { version = "0.15", default-features = false, features = ["image"], optional = true }
+vision-calibration-core = { version = "0.8", optional = true }
+vision-calibration-pipeline = { version = "0.8", optional = true }
+image = { version = "0.25", default-features = false, optional = true }
+nalgebra = { version = "0.34", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 v4l = "0.14"
 libc = "0.2"
 thiserror = "2"
@@ -38,6 +56,10 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dev-dependencies]
 # Examples need a window and an event loop, which the library itself does not.
 bevy = { version = "0.19", features = ["wayland", "x11"] }
+
+[[example]]
+name = "plane"
+required-features = ["calibration"]
 
 # Examples and tests: an unoptimised JPEG decoder takes >100 ms per 720p frame.
 [profile.dev.package."*"]

@@ -31,6 +31,8 @@
 #![cfg(target_os = "linux")]
 #![recursion_limit = "256"]
 
+#[cfg(feature = "calibration")]
+pub mod calibration;
 pub mod capture;
 pub mod controls;
 #[cfg(feature = "dmabuf")]
@@ -40,6 +42,11 @@ pub mod mjpeg;
 pub mod plugin;
 pub mod select;
 
+#[cfg(feature = "calibration")]
+pub use calibration::{
+    Calibrate, CalibrationPhase, CalibrationPlugin, CalibrationProgress, CalibrationRun,
+    CameraCalibration, ChessboardSpec, Detection, RollingShutter,
+};
 pub use capture::*;
 pub use controls::*;
 #[cfg(feature = "dmabuf")]

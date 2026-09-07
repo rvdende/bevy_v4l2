@@ -151,6 +151,13 @@ fn decode_loop(
 
         match result {
             Ok(()) => {
+                capture.publish_gray_from_rgba(
+                    &out,
+                    width,
+                    height,
+                    frame.sequence,
+                    frame.timestamp,
+                );
                 let decoded = DecodedFrame {
                     rgba: out,
                     sequence: frame.sequence,
