@@ -247,3 +247,210 @@ mod tests {
         assert!(choose_mode(&modes, Want::default()).is_none());
     }
 }
+
+/// Pixel format families a [`CameraFormat`] can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameFormat {
+    /// Whatever reaches the rate; raw (zero-copy) preferred over MJPEG.
+    #[default]
+    Any,
+    /// Packed 4:2:2 `Y0 U Y1 V`. Zero-copy.
+    Yuyv,
+    /// Packed 4:2:2 `U Y0 V Y1`. Zero-copy.
+    Uyvy,
+    /// One JPEG per frame, decoded on a CPU thread.
+    Mjpeg,
+}
+
+impl FrameFormat {
+    pub fn fourcc(self) -> Option<FourCC> {
+        match self {
+            FrameFormat::Any => None,
+            FrameFormat::Yuyv => Some(FOURCC_YUYV),
+            FrameFormat::Uyvy => Some(FOURCC_UYVY),
+            FrameFormat::Mjpeg => Some(FOURCC_MJPG),
+        }
+    }
+}
+
+/// A size, pixel format and rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraFormat {
+    pub width: u32,
+    pub height: u32,
+    pub format: FrameFormat,
+    pub fps: f32,
+}
+
+impl CameraFormat {
+    pub fn new(width: u32, height: u32, format: FrameFormat, fps: u32) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            fps: fps as f32,
+        }
+    }
+}
+
+/// How to pick a mode from what the device offers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RequestedFormat {
+    /// Exactly this size, format and rate, or fail to open.
+    Exact(CameraFormat),
+    /// This size if the device has it, else the nearest size; the format only if named; the
+    /// highest offered rate not above the requested one. Raw wins over MJPEG when both reach
+    /// the rate.
+    Closest(CameraFormat),
+    /// The largest mode that still runs at [`SMOOTH_FPS`] or better, raw preferred.
+    HighestResolution,
+    /// The fastest mode at any size, largest size on ties.
+    HighestFrameRate,
+}
+
+impl Default for RequestedFormat {
+    fn default() -> Self {
+        RequestedFormat::Closest(CameraFormat::new(1280, 720, FrameFormat::Any, 30))
+    }
+}
+
+/// Resolve a [`RequestedFormat`] against the device's modes.
+pub fn choose(modes: &[CaptureMode], request: RequestedFormat) -> Option<Choice> {
+    match request {
+        RequestedFormat::Exact(f) => {
+            let m = modes.iter().find(|m| {
+                m.width == f.width
+                    && m.height == f.height
+                    && f.format.fourcc().is_none_or(|c| c == m.fourcc)
+                    && is_supported(m.fourcc)
+                    && m.fps.iter().any(|r| (r - f.fps).abs() < 0.5)
+            })?;
+            Some(Choice {
+                fourcc: m.fourcc,
+                width: m.width,
+                height: m.height,
+                fps: f.fps,
+                raw: is_raw(m.fourcc),
+            })
+        }
+        RequestedFormat::Closest(f) => {
+            let want = Want {
+                width: Some(f.width),
+                height: Some(f.height),
+                fps: Some(f.fps),
+                fourcc: f.format.fourcc(),
+            };
+            choose_mode(modes, want).or_else(|| {
+                // No such size: take the offered size nearest in area, then apply the same rules.
+                let wanted_area = (f.width as i64) * (f.height as i64);
+                let nearest = modes
+                    .iter()
+                    .filter(|m| {
+                        is_supported(m.fourcc) && f.format.fourcc().is_none_or(|c| c == m.fourcc)
+                    })
+                    .min_by_key(|m| ((m.width as i64) * (m.height as i64) - wanted_area).abs())?;
+                choose_mode(
+                    modes,
+                    Want {
+                        width: Some(nearest.width),
+                        height: Some(nearest.height),
+                        ..want
+                    },
+                )
+            })
+        }
+        RequestedFormat::HighestResolution => choose_mode(modes, Want::default()),
+        RequestedFormat::HighestFrameRate => {
+            let max_fps = |m: &CaptureMode| m.fps.iter().copied().fold(0.0_f32, f32::max);
+            let m = modes
+                .iter()
+                .filter(|m| is_supported(m.fourcc) && !m.fps.is_empty())
+                .max_by_key(|m| {
+                    (
+                        (max_fps(m) * 1000.0) as u64,
+                        (m.width as u64) * (m.height as u64),
+                        is_raw(m.fourcc),
+                    )
+                })?;
+            Some(Choice {
+                fourcc: m.fourcc,
+                width: m.width,
+                height: m.height,
+                fps: max_fps(m),
+                raw: is_raw(m.fourcc),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn mode(fourcc: FourCC, w: u32, h: u32, fps: &[f32]) -> CaptureMode {
+        CaptureMode {
+            fourcc,
+            description: String::new(),
+            width: w,
+            height: h,
+            fps: fps.to_vec(),
+        }
+    }
+
+    fn brio() -> Vec<CaptureMode> {
+        vec![
+            mode(FOURCC_YUYV, 640, 480, &[30.0, 15.0]),
+            mode(FOURCC_YUYV, 1280, 720, &[30.0, 24.0]),
+            mode(FOURCC_YUYV, 1920, 1080, &[30.0]),
+            mode(FOURCC_MJPG, 640, 480, &[30.0]),
+            mode(FOURCC_MJPG, 1280, 720, &[90.0, 60.0, 30.0]),
+            mode(FOURCC_MJPG, 1920, 1080, &[60.0, 30.0]),
+            mode(FOURCC_MJPG, 3840, 2160, &[30.0]),
+        ]
+    }
+
+    #[test]
+    fn closest_with_named_mjpeg() {
+        let c = choose(
+            &brio(),
+            RequestedFormat::Closest(CameraFormat::new(640, 480, FrameFormat::Mjpeg, 30)),
+        )
+        .unwrap();
+        assert_eq!((c.fourcc, c.width, c.fps), (FOURCC_MJPG, 640, 30.0));
+    }
+
+    #[test]
+    fn closest_falls_back_to_the_nearest_size() {
+        let c = choose(
+            &brio(),
+            RequestedFormat::Closest(CameraFormat::new(1600, 900, FrameFormat::Any, 30)),
+        )
+        .unwrap();
+        assert_eq!((c.width, c.height, c.fourcc), (1280, 720, FOURCC_YUYV));
+    }
+
+    #[test]
+    fn exact_requires_the_rate() {
+        assert!(
+            choose(
+                &brio(),
+                RequestedFormat::Exact(CameraFormat::new(1280, 720, FrameFormat::Yuyv, 60))
+            )
+            .is_none()
+        );
+        let c = choose(
+            &brio(),
+            RequestedFormat::Exact(CameraFormat::new(1280, 720, FrameFormat::Any, 60)),
+        )
+        .unwrap();
+        assert_eq!(c.fourcc, FOURCC_MJPG);
+    }
+
+    #[test]
+    fn highest_frame_rate_and_resolution() {
+        let c = choose(&brio(), RequestedFormat::HighestFrameRate).unwrap();
+        assert_eq!((c.width, c.fps), (1280, 90.0));
+        let c = choose(&brio(), RequestedFormat::HighestResolution).unwrap();
+        assert_eq!(c.width, 3840);
+    }
+}

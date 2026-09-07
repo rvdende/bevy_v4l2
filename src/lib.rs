@@ -5,7 +5,7 @@
 //!   non-snooping GPU coherent with the driver's writes.
 //! * [`dmabuf`] (feature `dmabuf`): enables the Vulkan extensions during Bevy's device creation
 //!   and wraps a DMA-BUF as a `wgpu::Texture` with no copy.
-//! * [`plugin`]: [`WebcamPlugin`], which puts the feed on a plane with a material whose shader
+//! * [`plugin`]: [`WebcamPlugin`] and the [`Webcam`] component, which put the feed on a plane with a material whose shader
 //!   converts packed YUV to RGB on the GPU; MJPEG streams are decoded on a thread
 //!   (feature `mjpeg`).
 //! * [`select`]: picks the best mode for a wanted size and rate, preferring raw (zero-copy).
@@ -13,13 +13,16 @@
 //!
 //! ```no_run
 //! use bevy::prelude::*;
-//! use bevy_v4l2::{DmabufTexturePlugin, WebcamPlugin};
+//! use bevy_v4l2::{DmabufTexturePlugin, Webcam, WebcamPlugin};
 //!
 //! App::new()
 //!     // Must come before DefaultPlugins so the Vulkan device gets the DMA-BUF extensions.
 //!     .add_plugins(DmabufTexturePlugin)
 //!     .add_plugins(DefaultPlugins)
-//!     .add_plugins(WebcamPlugin::want(1280, 720, 60.0))
+//!     .add_plugins(WebcamPlugin)
+//!     .add_systems(Startup, |mut commands: Commands| {
+//!         commands.spawn((Webcam::want(1280, 720, 60), Transform::from_xyz(0.0, 0.45, 0.0)));
+//!     })
 //!     .run();
 //! ```
 //!

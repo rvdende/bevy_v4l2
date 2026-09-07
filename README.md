@@ -7,22 +7,37 @@ reaches the wanted frame rate.
 
 ```rust
 use bevy::prelude::*;
-use bevy_v4l2::{DmabufTexturePlugin, WebcamPlugin};
+use bevy_v4l2::{CameraFormat, DmabufTexturePlugin, FrameFormat, RequestedFormat, Webcam, WebcamPlugin};
 
 fn main() {
     App::new()
         // Must come before DefaultPlugins so the Vulkan device gets the DMA-BUF extensions.
         .add_plugins(DmabufTexturePlugin)
         .add_plugins(DefaultPlugins)
-        // 1280x720 at 60 fps, format chosen automatically: raw zero-copy if it reaches the
-        // rate, MJPEG otherwise.
-        .add_plugins(WebcamPlugin::want(1280, 720, 60.0))
+        .add_plugins(WebcamPlugin)
+        .add_systems(Startup, setup)
         .run();
+}
+
+fn setup(mut commands: Commands) {
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 1.3, 2.4).looking_at(Vec3::new(0.0, 0.45, 0.0), Vec3::Y),
+    ));
+    // 1280x720 at 60 fps; raw zero-copy if a raw mode reaches the rate, MJPEG otherwise. The
+    // plugin attaches a plane sized to the camera's aspect ratio.
+    commands.spawn((
+        Webcam::new(RequestedFormat::Closest(CameraFormat::new(1280, 720, FrameFormat::Any, 60))),
+        Transform::from_xyz(0.0, 0.45, 0.0),
+    ));
 }
 ```
 
-`WebcamPlugin::default()` opens `/dev/video0` at 1280x720 YUYV 30 fps without choosing. For full
-control fill in `WebcamPlugin { config: CaptureConfig { .. }, .. }`, or use
+`RequestedFormat` has `Exact`, `Closest`, `HighestResolution` and `HighestFrameRate`;
+`FrameFormat` is `Any`, `Yuyv`, `Uyvy` or `Mjpeg`. `Webcam::want(w, h, fps)` is shorthand for the
+`Closest`/`Any` request above, `Webcam::auto()` for `HighestResolution`, and `.device(path)`
+picks a node other than `/dev/video0`. Give the entity your own `Mesh3d` to show the feed on any
+shape. For lower-level use see
 [`list_modes`](https://docs.rs/bevy_v4l2/latest/bevy_v4l2/fn.list_modes.html) and
 [`choose_mode`](https://docs.rs/bevy_v4l2/latest/bevy_v4l2/fn.choose_mode.html) yourself.
 
@@ -32,9 +47,9 @@ control fill in `WebcamPlugin { config: CaptureConfig { .. }, .. }`, or use
 |---|---|
 | `capture` | `Capture`: V4L2 streaming with `MMAP` buffers exported as DMA-BUF fds, newest-frame-wins delivery, damaged-frame accounting, CPU cache write-back |
 | `dmabuf` | `DmabufTexturePlugin` (enables `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`, `VK_EXT_queue_family_foreign` during Bevy's device creation) and `import_dmabuf_texture` |
-| `plugin` | `WebcamPlugin`, `WebcamMaterial` with the YUV shader, `WebcamShared` (texture handle, stats), `WebcamStats` |
+| `plugin` | `WebcamPlugin`, the `Webcam` component, `WebcamMaterial` with the YUV shader, `WebcamFeed` (texture handle, stats), `WebcamStats` |
 | `mjpeg` | `Decoder`: a decode thread with buffer recycling |
-| `select` | `choose_mode`: the mode policy, with tests |
+| `select` | `RequestedFormat`, `CameraFormat`, `FrameFormat`, `choose`: the mode policy, with tests |
 | `controls` | `devices()`, `settings()`, `get_setting`, `set_setting`, `set_focus` (turns autofocus off first) |
 
 Features: `dmabuf` (default) and `mjpeg` (default). Without `dmabuf` frames are uploaded with
@@ -53,7 +68,7 @@ Features: `dmabuf` (default) and `mjpeg` (default). Without `dmabuf` frames are 
 uvcvideo writes frames with CPU `memcpy`. A GPU reading the DMA-BUF over PCIe does not snoop the
 CPU cache, so lines still dirty in L3 arrive stale and show up as short horizontal streaks. The
 capture thread therefore writes back the CPU cache for each frame after dequeue
-(`clflushopt` + `sfence`, about 70 µs at 1080p). `WebcamPlugin { verify_frames: 90, .. }` reads
+(`clflushopt` + `sfence`, about 70 µs at 1080p). `Webcam { verify_frames: 90, .. }` reads
 GPU copies back and diffs them against the kernel buffer to prove it on your hardware.
 
 ## Measured (Logitech BRIO, USB 3, RTX 4090, NVIDIA 595)

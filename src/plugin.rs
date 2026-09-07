@@ -1,4 +1,4 @@
-//! [`WebcamPlugin`]: a V4L2 camera on a plane.
+//! [`WebcamPlugin`] and the [`Webcam`] component: a V4L2 camera on a plane.
 //!
 //! Data path per frame, raw formats:
 //! 1. The kernel driver writes into an `MMAP` buffer that was exported as a DMA-BUF at start-up.
@@ -10,7 +10,7 @@
 //!
 //! MJPEG streams are decoded to RGBA on a thread and uploaded. If DMA-BUF import is unavailable
 //! the plugin falls back to `queue.write_texture` from the mmap'd buffer and says so in
-//! [`WebcamStats::mode`].
+//! [`WebcamStats::mode`]. Spawn one [`Webcam`] per device.
 
 use std::{
     sync::{Arc, Mutex},
@@ -25,13 +25,14 @@ use bevy::{
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
-        extract_resource::{ExtractResource, ExtractResourcePlugin},
+        extract_component::{ExtractComponent, ExtractComponentPlugin},
         render_asset::RenderAssets,
         render_resource::{
             AsBindGroup, Extent3d, RenderPipelineDescriptor, ShaderType,
             SpecializedMeshPipelineError, TextureDimension, TextureFormat, TextureUsages,
         },
         renderer::{RenderDevice, RenderQueue},
+        sync_world::SyncToRenderWorld,
         texture::GpuImage,
     },
     shader::ShaderRef,
@@ -42,120 +43,130 @@ use crate::capture::DequeuedFrame;
 use crate::capture::{Capture, CaptureConfig, FOURCC_MJPG, FOURCC_UYVY, FOURCC_YUYV, FrameLayout};
 #[cfg(feature = "mjpeg")]
 use crate::mjpeg::Decoder;
-use crate::select::{Want, choose_mode};
+use crate::select::{CameraFormat, FrameFormat, RequestedFormat, choose};
 
-/// Puts a webcam feed on a plane. Add after `DefaultPlugins`.
-///
-/// For the zero-copy path, [`crate::DmabufTexturePlugin`] must be added *before* `DefaultPlugins`.
-pub struct WebcamPlugin {
-    /// Device and mode. When `want` is set, its size, format and rate are chosen from what the
-    /// device offers at start-up and override the ones here.
-    pub config: CaptureConfig,
-    /// Pick the mode automatically (see [`crate::choose_mode`]): a raw, zero-copy mode that
-    /// reaches the wanted rate, else MJPEG, else the fastest available.
-    pub want: Option<Want>,
-    /// Flip horizontally, like a mirror.
-    pub mirror: bool,
-    /// Skip DMA-BUF import and always upload through the CPU (for comparison).
-    pub force_upload: bool,
-    /// Spawn a plane showing the feed at start-up. Set to `false` to use [`WebcamShared::image`]
-    /// and [`WebcamMaterial`] yourself.
-    pub spawn_plane: bool,
-    /// Height of the spawned plane in world units; width follows the aspect ratio.
-    pub plane_height: f32,
-    /// Where the spawned plane goes.
-    pub plane_transform: Transform,
-    /// Read back the first N GPU copies and compare them byte-for-byte with the kernel buffer.
-    pub verify_frames: u32,
-    /// Skip the foreign-queue acquire/release barriers (diagnostic).
-    pub no_barrier: bool,
-}
-
-impl Default for WebcamPlugin {
-    fn default() -> Self {
-        Self {
-            config: CaptureConfig::default(),
-            want: None,
-            mirror: false,
-            force_upload: false,
-            spawn_plane: true,
-            plane_height: 0.9,
-            plane_transform: Transform::from_xyz(0.0, 0.45, 0.0),
-            verify_frames: 0,
-            no_barrier: false,
-        }
-    }
-}
-
-impl WebcamPlugin {
-    /// `/dev/video0` at the given size and rate, format chosen automatically.
-    pub fn want(width: u32, height: u32, fps: f32) -> Self {
-        Self {
-            want: Some(Want {
-                width: Some(width),
-                height: Some(height),
-                fps: Some(fps),
-                fourcc: None,
-            }),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_device(mut self, device: impl Into<std::path::PathBuf>) -> Self {
-        self.config.device = device.into();
-        self
-    }
-}
+/// Registers the webcam material and the systems that drive [`Webcam`] entities. Add after
+/// `DefaultPlugins`. For the zero-copy path, [`crate::DmabufTexturePlugin`] must be added
+/// *before* `DefaultPlugins`.
+#[derive(Default)]
+pub struct WebcamPlugin;
 
 impl Plugin for WebcamPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "webcam.wgsl");
         app.add_plugins((
             MaterialPlugin::<WebcamMaterial>::default(),
-            ExtractResourcePlugin::<WebcamShared>::default(),
+            ExtractComponentPlugin::<WebcamFeed>::default(),
         ))
-        .insert_resource(WebcamSettings {
-            config: self.config.clone(),
-            want: self.want,
-            mirror: self.mirror,
-            force_upload: self.force_upload,
-            spawn_plane: self.spawn_plane,
-            plane_height: self.plane_height,
-            plane_transform: self.plane_transform,
-            verify_frames: self.verify_frames,
-            no_barrier: self.no_barrier,
-        })
-        .init_resource::<WebcamStatus>()
-        .add_systems(Startup, start_webcam)
-        .add_systems(Update, log_stats);
+        .add_systems(Update, (start_webcams, log_stats));
 
-        app.sub_app_mut(RenderApp)
-            .init_resource::<WebcamGpu>()
-            .add_systems(
-                Render,
-                upload_webcam_frame.in_set(RenderSystems::PrepareResources),
-            );
+        app.sub_app_mut(RenderApp).add_systems(
+            Render,
+            upload_webcam_frames.in_set(RenderSystems::PrepareResources),
+        );
     }
 }
 
-#[derive(Resource, Clone)]
-struct WebcamSettings {
-    config: CaptureConfig,
-    want: Option<Want>,
-    mirror: bool,
-    force_upload: bool,
-    spawn_plane: bool,
-    plane_height: f32,
-    plane_transform: Transform,
-    verify_frames: u32,
-    no_barrier: bool,
+/// A camera to show on this entity. Spawn it with a `Transform`; the plugin opens the device on
+/// the next update, attaches a [`WebcamFeed`], a plane mesh (unless the entity already has a
+/// `Mesh3d`) and a [`WebcamMaterial`], and sets [`WebcamStatus`].
+///
+/// ```no_run
+/// # use bevy::prelude::*;
+/// # use bevy_v4l2::{CameraFormat, FrameFormat, RequestedFormat, Webcam};
+/// # fn setup(mut commands: Commands) {
+/// commands.spawn((
+///     Webcam::new(RequestedFormat::Closest(CameraFormat::new(1280, 720, FrameFormat::Any, 60))),
+///     Transform::from_xyz(0.0, 0.45, 0.0),
+/// ));
+/// # }
+/// ```
+#[derive(Component, Clone, Debug)]
+#[require(Transform, Visibility, SyncToRenderWorld)]
+pub struct Webcam {
+    /// The V4L2 node, e.g. `/dev/video0`.
+    pub device: std::path::PathBuf,
+    /// Which of the device's modes to use.
+    pub format: RequestedFormat,
+    /// Number of kernel buffers. More tolerate GPU stalls; the consumer always takes the newest
+    /// frame, so depth does not add latency by itself.
+    pub buffers: u32,
+    /// Write back the CPU cache for each frame so a non-snooping GPU sees the driver's writes.
+    /// Leave on unless you have verified your platform does not need it.
+    pub flush_cpu_cache: bool,
+    /// Flip horizontally, like a mirror.
+    pub mirror: bool,
+    /// Skip DMA-BUF import and always upload through the CPU (for comparison).
+    pub force_upload: bool,
+    /// Height of the plane the plugin spawns, in world units; width follows the aspect ratio.
+    /// Ignored when the entity already has a `Mesh3d`.
+    pub plane_height: f32,
+    /// Read back the first N GPU copies and compare them byte-for-byte with the kernel buffer.
+    pub verify_frames: u32,
+    /// Skip the foreign-queue acquire/release barriers (diagnostic).
+    pub no_barrier: bool,
 }
 
-/// Outcome of opening the camera.
-#[derive(Resource, Default, Debug)]
+impl Default for Webcam {
+    fn default() -> Self {
+        Self {
+            device: "/dev/video0".into(),
+            format: RequestedFormat::default(),
+            buffers: 4,
+            flush_cpu_cache: true,
+            mirror: false,
+            force_upload: false,
+            plane_height: 0.9,
+            verify_frames: 0,
+            no_barrier: false,
+        }
+    }
+}
+
+impl Webcam {
+    /// `/dev/video0` with this format request.
+    pub fn new(format: RequestedFormat) -> Self {
+        Self {
+            format,
+            ..Default::default()
+        }
+    }
+
+    /// `/dev/video0` at the given size and rate, format chosen automatically (raw zero-copy if
+    /// it reaches the rate, else MJPEG).
+    pub fn want(width: u32, height: u32, fps: u32) -> Self {
+        Self::new(RequestedFormat::Closest(CameraFormat::new(
+            width,
+            height,
+            FrameFormat::Any,
+            fps,
+        )))
+    }
+
+    /// The largest mode that still runs smoothly.
+    pub fn auto() -> Self {
+        Self::new(RequestedFormat::HighestResolution)
+    }
+
+    pub fn device(mut self, device: impl Into<std::path::PathBuf>) -> Self {
+        self.device = device.into();
+        self
+    }
+
+    pub fn mirror(mut self, mirror: bool) -> Self {
+        self.mirror = mirror;
+        self
+    }
+
+    pub fn plane_height(mut self, height: f32) -> Self {
+        self.plane_height = height;
+        self
+    }
+}
+
+/// Outcome of opening the camera, inserted next to [`Webcam`].
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub enum WebcamStatus {
-    #[default]
-    Starting,
     Running,
     Failed(String),
 }
@@ -184,7 +195,7 @@ impl TransferMode {
     }
 }
 
-/// Live statistics, updated by the render world. Read through [`WebcamShared::stats`].
+/// Live statistics, updated by the render world. Read through [`WebcamFeed::stats`].
 #[derive(Debug, Clone, Default)]
 pub struct WebcamStats {
     pub mode: TransferMode,
@@ -243,9 +254,9 @@ impl WebcamStats {
     }
 }
 
-/// Shared between the main world and the render world once the camera is running.
-#[derive(Resource, Clone)]
-pub struct WebcamShared {
+/// The running capture behind a [`Webcam`] entity. Cloned into the render world each frame.
+#[derive(Component, Clone)]
+pub struct WebcamFeed {
     pub capture: Arc<Capture>,
     /// The texture the material samples. Raw formats: `Rgba8Unorm`, half the frame width, one
     /// texel per pixel pair. MJPEG: `Rgba8UnormSrgb`, full width.
@@ -254,6 +265,7 @@ pub struct WebcamShared {
     pub stats: Arc<Mutex<WebcamStats>>,
     #[cfg(feature = "mjpeg")]
     pub decoder: Option<Arc<Decoder>>,
+    gpu: Arc<Mutex<WebcamGpu>>,
     force_upload: bool,
     #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     verify_frames: u32,
@@ -261,10 +273,12 @@ pub struct WebcamShared {
     no_barrier: bool,
 }
 
-impl ExtractResource for WebcamShared {
-    type Source = WebcamShared;
-    fn extract_resource(source: &Self::Source) -> Self {
-        source.clone()
+impl ExtractComponent for WebcamFeed {
+    type QueryData = &'static WebcamFeed;
+    type QueryFilter = ();
+    type Out = WebcamFeed;
+    fn extract_component(item: &WebcamFeed) -> Option<Self> {
+        Some(item.clone())
     }
 }
 
@@ -310,79 +324,100 @@ impl Material for WebcamMaterial {
     }
 }
 
-/// Marker for the plane entity spawned by the plugin.
-#[derive(Component)]
-pub struct WebcamPlane;
-
-fn start_webcam(
+/// Opens the device for every newly added [`Webcam`] and attaches the feed.
+#[allow(clippy::type_complexity)]
+fn start_webcams(
     mut commands: Commands,
-    settings: Res<WebcamSettings>,
-    mut status: ResMut<WebcamStatus>,
+    new: Query<
+        (Entity, &Webcam, Has<Mesh3d>),
+        (Added<Webcam>, Without<WebcamFeed>, Without<WebcamStatus>),
+    >,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WebcamMaterial>>,
 ) {
-    let fail = |status: &mut WebcamStatus, msg: String| {
-        error!("{msg}");
-        *status = WebcamStatus::Failed(msg);
-    };
-    let mut config = settings.config.clone();
-    if let Some(want) = settings.want {
-        match crate::capture::list_modes(&config.device).map(|modes| choose_mode(&modes, want)) {
-            Ok(Some(c)) => {
+    for (entity, webcam, has_mesh) in &new {
+        match open_feed(webcam, &mut images) {
+            Ok((feed, flags)) => {
+                let layout = feed.layout;
+                let material = materials.add(WebcamMaterial {
+                    frame: feed.image.clone(),
+                    params: WebcamParams {
+                        width: layout.width,
+                        height: layout.height,
+                        flags,
+                        _pad: 0,
+                    },
+                });
+                let mut e = commands.entity(entity);
+                if !has_mesh {
+                    let height = webcam.plane_height;
+                    let width = height * layout.width as f32 / layout.height as f32;
+                    e.insert(Mesh3d(meshes.add(Rectangle::new(width, height))));
+                }
+                e.insert((MeshMaterial3d(material), feed, WebcamStatus::Running));
                 info!(
-                    "webcam: chose {}x{} {} @ {:.0} fps ({})",
-                    c.width,
-                    c.height,
-                    c.fourcc,
-                    c.fps,
-                    if c.raw {
-                        "raw, zero-copy"
-                    } else {
-                        "MJPEG, CPU decode"
-                    }
+                    "webcam running: {}x{} {}",
+                    layout.width, layout.height, layout.fourcc
                 );
-                config.width = c.width;
-                config.height = c.height;
-                config.fourcc = c.fourcc;
-                config.fps = Some(c.fps.round() as u32);
             }
-            Ok(None) => {
-                warn!("webcam: no mode matches {want:?}; passing the request to the driver")
+            Err(msg) => {
+                error!("{msg}");
+                commands.entity(entity).insert(WebcamStatus::Failed(msg));
             }
-            Err(e) => warn!(
-                "webcam: cannot enumerate {}: {e}; passing the request to the driver",
-                config.device.display()
-            ),
         }
     }
-    let capture = match Capture::open(&config) {
-        Ok(c) => c,
-        Err(e) => return fail(&mut status, format!("webcam unavailable: {e}")),
+}
+
+fn open_feed(webcam: &Webcam, images: &mut Assets<Image>) -> Result<(WebcamFeed, u32), String> {
+    let modes = crate::capture::list_modes(&webcam.device)
+        .map_err(|e| format!("cannot enumerate {}: {e}", webcam.device.display()))?;
+    let choice = choose(&modes, webcam.format).ok_or_else(|| {
+        format!(
+            "{} offers nothing matching {:?}",
+            webcam.device.display(),
+            webcam.format
+        )
+    })?;
+    info!(
+        "webcam: {} -> {}x{} {} @ {:.0} fps ({})",
+        webcam.device.display(),
+        choice.width,
+        choice.height,
+        choice.fourcc,
+        choice.fps,
+        if choice.raw {
+            "raw, zero-copy"
+        } else {
+            "MJPEG, CPU decode"
+        }
+    );
+    let config = CaptureConfig {
+        device: webcam.device.clone(),
+        width: choice.width,
+        height: choice.height,
+        fourcc: choice.fourcc,
+        fps: Some(choice.fps.round() as u32),
+        buffer_count: webcam.buffers,
+        flush_cpu_cache: webcam.flush_cpu_cache,
     };
+    let capture = Capture::open(&config).map_err(|e| format!("webcam unavailable: {e}"))?;
     let layout = capture.layout();
     let fourcc = layout.fourcc;
     let mjpeg = fourcc == FOURCC_MJPG;
     if mjpeg && !cfg!(feature = "mjpeg") {
-        return fail(
-            &mut status,
-            "stream is MJPEG but the `mjpeg` feature is disabled".into(),
-        );
+        return Err("stream is MJPEG but the `mjpeg` feature is disabled".into());
     }
     if !mjpeg && fourcc != FOURCC_YUYV && fourcc != FOURCC_UYVY {
-        return fail(
-            &mut status,
-            format!("unsupported pixel format {fourcc}; only YUYV, UYVY and MJPG are handled"),
-        );
+        return Err(format!(
+            "unsupported pixel format {fourcc}; only YUYV, UYVY and MJPG are handled"
+        ));
     }
     if !mjpeg && layout.width % 2 != 0 {
-        return fail(
-            &mut status,
-            format!(
-                "frame width {} is odd; packed 4:2:2 needs an even width",
-                layout.width
-            ),
-        );
+        return Err(format!(
+            "frame width {} is odd; packed 4:2:2 needs an even width",
+            layout.width
+        ));
     }
 
     // Raw 4:2:2: one texel per pixel pair (Y0, U, Y1, V). MJPEG: decoded sRGB RGBA, full width.
@@ -415,7 +450,7 @@ fn start_webcam(
     if mjpeg {
         flags |= FLAG_RGBA;
     }
-    if settings.mirror {
+    if webcam.mirror {
         flags |= FLAG_MIRROR;
     }
     if fourcc == FOURCC_UYVY {
@@ -423,26 +458,6 @@ fn start_webcam(
     }
     if layout.full_range {
         flags |= FLAG_FULL_RANGE;
-    }
-
-    if settings.spawn_plane {
-        let material = materials.add(WebcamMaterial {
-            frame: image.clone(),
-            params: WebcamParams {
-                width: layout.width,
-                height: layout.height,
-                flags,
-                _pad: 0,
-            },
-        });
-        let height = settings.plane_height;
-        let width = height * layout.width as f32 / layout.height as f32;
-        commands.spawn((
-            WebcamPlane,
-            Mesh3d(meshes.add(Rectangle::new(width, height))),
-            MeshMaterial3d(material),
-            settings.plane_transform,
-        ));
     }
 
     let capture = Arc::new(capture);
@@ -454,39 +469,40 @@ fn start_webcam(
             layout.height,
         ))
     });
-    commands.insert_resource(WebcamShared {
-        capture,
-        image,
-        layout,
-        stats: Arc::new(Mutex::new(WebcamStats::default())),
-        #[cfg(feature = "mjpeg")]
-        decoder,
-        force_upload: settings.force_upload,
-        verify_frames: settings.verify_frames,
-        no_barrier: settings.no_barrier,
-    });
-    *status = WebcamStatus::Running;
-    info!(
-        "webcam running: {}x{} {}",
-        layout.width, layout.height, fourcc
-    );
+    Ok((
+        WebcamFeed {
+            capture,
+            image,
+            layout,
+            stats: Arc::new(Mutex::new(WebcamStats::default())),
+            #[cfg(feature = "mjpeg")]
+            decoder,
+            gpu: Arc::new(Mutex::new(WebcamGpu::default())),
+            force_upload: webcam.force_upload,
+            verify_frames: webcam.verify_frames,
+            no_barrier: webcam.no_barrier,
+        },
+        flags,
+    ))
 }
 
-/// Logs the stats line every few seconds so the active path and rate are visible without a UI.
-fn log_stats(time: Res<Time>, shared: Option<Res<WebcamShared>>, mut next: Local<f32>) {
-    let Some(shared) = shared else { return };
+/// Logs each feed's stats line every few seconds so the active path and rate are visible
+/// without a UI.
+fn log_stats(time: Res<Time>, feeds: Query<&WebcamFeed>, mut next: Local<f32>) {
     if time.elapsed_secs() < *next {
         return;
     }
     *next = time.elapsed_secs() + 5.0;
-    let stats = shared.stats.lock().unwrap();
-    if stats.frames > 0 {
-        info!("webcam: {}", stats.describe(&shared.layout));
+    for feed in &feeds {
+        let stats = feed.stats.lock().unwrap();
+        if stats.frames > 0 {
+            info!("webcam: {}", stats.describe(&feed.layout));
+        }
     }
 }
 
 /// Render-world state: imported textures, one per V4L2 buffer.
-#[derive(Resource, Default)]
+#[derive(Default)]
 #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
 struct WebcamGpu {
     mode: TransferMode,
@@ -513,9 +529,8 @@ impl WebcamGpu {
     }
 }
 
-fn upload_webcam_frame(
-    shared: Option<Res<WebcamShared>>,
-    mut gpu: ResMut<WebcamGpu>,
+fn upload_webcam_frames(
+    feeds: Query<&WebcamFeed>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     images: Res<RenderAssets<GpuImage>>,
@@ -523,18 +538,39 @@ fn upload_webcam_frame(
         Res<bevy::render::renderer::raw_vulkan_init::AdditionalVulkanFeatures>,
     >,
 ) {
-    let Some(shared) = shared else { return };
+    for feed in &feeds {
+        upload_one(
+            feed,
+            &device,
+            &queue,
+            &images,
+            #[cfg(feature = "dmabuf")]
+            features.as_deref(),
+        );
+    }
+}
+
+fn upload_one(
+    shared: &WebcamFeed,
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    images: &RenderAssets<GpuImage>,
+    #[cfg(feature = "dmabuf")] features: Option<
+        &bevy::render::renderer::raw_vulkan_init::AdditionalVulkanFeatures,
+    >,
+) {
     let Some(gpu_image) = images.get(&shared.image) else {
         return;
     };
+    let mut gpu = shared.gpu.lock().unwrap();
 
     if gpu.mode == TransferMode::Unknown {
         gpu.mode = decide_mode(
             &mut gpu,
-            &shared,
-            &device,
+            shared,
+            device,
             #[cfg(feature = "dmabuf")]
-            features.as_deref(),
+            features,
         );
         shared.stats.lock().unwrap().mode = gpu.mode;
     }
@@ -575,8 +611,13 @@ fn upload_webcam_frame(
     let capture = &shared.capture;
     let before = capture.dequeued_count();
     let Some(frame) = capture.try_recv_latest() else {
+        debug!("webcam: no new frame (dequeued so far {before})");
         return;
     };
+    debug!(
+        "webcam: frame seq {} buffer {} mode {:?}",
+        frame.sequence, frame.index, gpu.mode
+    );
     let latency = frame.age();
     let index = frame.index as usize;
     let layout = shared.layout;
@@ -613,12 +654,12 @@ fn upload_webcam_frame(
             if gpu.verified < shared.verify_frames {
                 gpu.verified += 1;
                 verify_copy(
-                    &device,
-                    &queue,
+                    device,
+                    queue,
                     encoder,
                     &gpu_image.texture,
                     size,
-                    shared.as_ref(),
+                    shared,
                     &frame,
                 );
                 capture.requeue(frame.index);
@@ -660,7 +701,7 @@ fn upload_webcam_frame(
 
 fn decide_mode(
     gpu: &mut WebcamGpu,
-    shared: &WebcamShared,
+    shared: &WebcamFeed,
     device: &RenderDevice,
     #[cfg(feature = "dmabuf")] features: Option<
         &bevy::render::renderer::raw_vulkan_init::AdditionalVulkanFeatures,
@@ -707,7 +748,7 @@ fn decide_mode(
 #[cfg(feature = "dmabuf")]
 fn import_all(
     device: &RenderDevice,
-    shared: &WebcamShared,
+    shared: &WebcamFeed,
 ) -> Result<Vec<wgpu::Texture>, crate::dmabuf::DmabufImportError> {
     use crate::dmabuf::{
         DRM_FORMAT_MOD_LINEAR, DmabufImageDesc, DmabufPlane, import_dmabuf_texture,
@@ -748,7 +789,7 @@ fn verify_copy(
     mut encoder: wgpu::CommandEncoder,
     dst: &wgpu::Texture,
     size: Extent3d,
-    shared: &WebcamShared,
+    shared: &WebcamFeed,
     frame: &DequeuedFrame,
 ) {
     let layout = shared.layout;
