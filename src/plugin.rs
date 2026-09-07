@@ -42,12 +42,18 @@ use crate::capture::DequeuedFrame;
 use crate::capture::{Capture, CaptureConfig, FOURCC_MJPG, FOURCC_UYVY, FOURCC_YUYV, FrameLayout};
 #[cfg(feature = "mjpeg")]
 use crate::mjpeg::Decoder;
+use crate::select::{Want, choose_mode};
 
 /// Puts a webcam feed on a plane. Add after `DefaultPlugins`.
 ///
 /// For the zero-copy path, [`crate::DmabufTexturePlugin`] must be added *before* `DefaultPlugins`.
 pub struct WebcamPlugin {
+    /// Device and mode. When `want` is set, its size, format and rate are chosen from what the
+    /// device offers at start-up and override the ones here.
     pub config: CaptureConfig,
+    /// Pick the mode automatically (see [`crate::choose_mode`]): a raw, zero-copy mode that
+    /// reaches the wanted rate, else MJPEG, else the fastest available.
+    pub want: Option<Want>,
     /// Flip horizontally, like a mirror.
     pub mirror: bool,
     /// Skip DMA-BUF import and always upload through the CPU (for comparison).
@@ -69,6 +75,7 @@ impl Default for WebcamPlugin {
     fn default() -> Self {
         Self {
             config: CaptureConfig::default(),
+            want: None,
             mirror: false,
             force_upload: false,
             spawn_plane: true,
@@ -77,6 +84,26 @@ impl Default for WebcamPlugin {
             verify_frames: 0,
             no_barrier: false,
         }
+    }
+}
+
+impl WebcamPlugin {
+    /// `/dev/video0` at the given size and rate, format chosen automatically.
+    pub fn want(width: u32, height: u32, fps: f32) -> Self {
+        Self {
+            want: Some(Want {
+                width: Some(width),
+                height: Some(height),
+                fps: Some(fps),
+                fourcc: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_device(mut self, device: impl Into<std::path::PathBuf>) -> Self {
+        self.config.device = device.into();
+        self
     }
 }
 
@@ -89,6 +116,7 @@ impl Plugin for WebcamPlugin {
         ))
         .insert_resource(WebcamSettings {
             config: self.config.clone(),
+            want: self.want,
             mirror: self.mirror,
             force_upload: self.force_upload,
             spawn_plane: self.spawn_plane,
@@ -98,7 +126,8 @@ impl Plugin for WebcamPlugin {
             no_barrier: self.no_barrier,
         })
         .init_resource::<WebcamStatus>()
-        .add_systems(Startup, start_webcam);
+        .add_systems(Startup, start_webcam)
+        .add_systems(Update, log_stats);
 
         app.sub_app_mut(RenderApp)
             .init_resource::<WebcamGpu>()
@@ -112,6 +141,7 @@ impl Plugin for WebcamPlugin {
 #[derive(Resource, Clone)]
 struct WebcamSettings {
     config: CaptureConfig,
+    want: Option<Want>,
     mirror: bool,
     force_upload: bool,
     spawn_plane: bool,
@@ -296,7 +326,37 @@ fn start_webcam(
         error!("{msg}");
         *status = WebcamStatus::Failed(msg);
     };
-    let capture = match Capture::open(&settings.config) {
+    let mut config = settings.config.clone();
+    if let Some(want) = settings.want {
+        match crate::capture::list_modes(&config.device).map(|modes| choose_mode(&modes, want)) {
+            Ok(Some(c)) => {
+                info!(
+                    "webcam: chose {}x{} {} @ {:.0} fps ({})",
+                    c.width,
+                    c.height,
+                    c.fourcc,
+                    c.fps,
+                    if c.raw {
+                        "raw, zero-copy"
+                    } else {
+                        "MJPEG, CPU decode"
+                    }
+                );
+                config.width = c.width;
+                config.height = c.height;
+                config.fourcc = c.fourcc;
+                config.fps = Some(c.fps.round() as u32);
+            }
+            Ok(None) => {
+                warn!("webcam: no mode matches {want:?}; passing the request to the driver")
+            }
+            Err(e) => warn!(
+                "webcam: cannot enumerate {}: {e}; passing the request to the driver",
+                config.device.display()
+            ),
+        }
+    }
+    let capture = match Capture::open(&config) {
         Ok(c) => c,
         Err(e) => return fail(&mut status, format!("webcam unavailable: {e}")),
     };
@@ -410,6 +470,19 @@ fn start_webcam(
         "webcam running: {}x{} {}",
         layout.width, layout.height, fourcc
     );
+}
+
+/// Logs the stats line every few seconds so the active path and rate are visible without a UI.
+fn log_stats(time: Res<Time>, shared: Option<Res<WebcamShared>>, mut next: Local<f32>) {
+    let Some(shared) = shared else { return };
+    if time.elapsed_secs() < *next {
+        return;
+    }
+    *next = time.elapsed_secs() + 5.0;
+    let stats = shared.stats.lock().unwrap();
+    if stats.frames > 0 {
+        info!("webcam: {}", stats.describe(&shared.layout));
+    }
 }
 
 /// Render-world state: imported textures, one per V4L2 buffer.

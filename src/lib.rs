@@ -19,7 +19,7 @@
 //!     // Must come before DefaultPlugins so the Vulkan device gets the DMA-BUF extensions.
 //!     .add_plugins(DmabufTexturePlugin)
 //!     .add_plugins(DefaultPlugins)
-//!     .add_plugins(WebcamPlugin::default())
+//!     .add_plugins(WebcamPlugin::want(1280, 720, 60.0))
 //!     .run();
 //! ```
 //!

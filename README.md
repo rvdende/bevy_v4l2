@@ -14,15 +14,17 @@ fn main() {
         // Must come before DefaultPlugins so the Vulkan device gets the DMA-BUF extensions.
         .add_plugins(DmabufTexturePlugin)
         .add_plugins(DefaultPlugins)
-        .add_plugins(WebcamPlugin::default())
+        // 1280x720 at 60 fps, format chosen automatically: raw zero-copy if it reaches the
+        // rate, MJPEG otherwise.
+        .add_plugins(WebcamPlugin::want(1280, 720, 60.0))
         .run();
 }
 ```
 
-`WebcamPlugin::default()` opens `/dev/video0` at 1280x720 YUYV. Use
+`WebcamPlugin::default()` opens `/dev/video0` at 1280x720 YUYV 30 fps without choosing. For full
+control fill in `WebcamPlugin { config: CaptureConfig { .. }, .. }`, or use
 [`list_modes`](https://docs.rs/bevy_v4l2/latest/bevy_v4l2/fn.list_modes.html) and
-[`choose_mode`](https://docs.rs/bevy_v4l2/latest/bevy_v4l2/fn.choose_mode.html) to pick a mode
-for a wanted size and rate; raw modes win when they reach the rate, MJPEG otherwise.
+[`choose_mode`](https://docs.rs/bevy_v4l2/latest/bevy_v4l2/fn.choose_mode.html) yourself.
 
 ## What is in the crate
 
