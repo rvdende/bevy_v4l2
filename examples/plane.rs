@@ -1,8 +1,9 @@
 //! A webcam on a plane. Environment overrides: `WEBCAM_DEVICE`, `WEBCAM_WIDTH`, `WEBCAM_HEIGHT`,
 //! `WEBCAM_FPS`, `WEBCAM_FORMAT` (any|yuyv|uyvy|mjpeg), `WEBCAM_VERIFY` (frames to check),
-//! `WEBCAM_EXIT_AFTER` (seconds).
+//! `WEBCAM_EXIT_AFTER` (seconds), `WEBCAM_HEADLESS=1` (no window; renders off-screen, handy for
+//! CI or for verifying the capture path without disturbing the desktop).
 
-use bevy::prelude::*;
+use bevy::{app::ScheduleRunnerPlugin, prelude::*, window::ExitCondition, winit::WinitPlugin};
 use bevy_v4l2::{
     CameraFormat, DmabufTexturePlugin, FrameFormat, RequestedFormat, Webcam, WebcamPlugin,
 };
@@ -15,10 +16,26 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 fn main() {
-    App::new()
-        .add_plugins(DmabufTexturePlugin)
-        .add_plugins(DefaultPlugins)
-        .add_plugins(WebcamPlugin)
+    let mut app = App::new();
+    app.add_plugins(DmabufTexturePlugin);
+    if env("WEBCAM_HEADLESS", 0) == 1 {
+        app.add_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<WinitPlugin>()
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    ..default()
+                }),
+        )
+        .add_plugins(ScheduleRunnerPlugin::run_loop(
+            std::time::Duration::from_millis(2),
+        ));
+    } else {
+        app.add_plugins(DefaultPlugins);
+    }
+    app.add_plugins(WebcamPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, exit_after)
         .run();

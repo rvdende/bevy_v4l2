@@ -32,6 +32,7 @@ use bevy::{
             SpecializedMeshPipelineError, TextureDimension, TextureFormat, TextureUsages,
         },
         renderer::{RenderDevice, RenderQueue},
+        sync_component::SyncComponent,
         sync_world::SyncToRenderWorld,
         texture::GpuImage,
     },
@@ -271,6 +272,10 @@ pub struct WebcamFeed {
     verify_frames: u32,
     #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     no_barrier: bool,
+}
+
+impl SyncComponent for WebcamFeed {
+    type Target = WebcamFeed;
 }
 
 impl ExtractComponent for WebcamFeed {
@@ -630,7 +635,7 @@ fn upload_one(
     match gpu.mode {
         #[cfg(feature = "dmabuf")]
         TransferMode::DmabufZeroCopy => {
-            use crate::dmabuf::{ash::vk, record_foreign_acquire, record_foreign_release};
+            use crate::dmabuf::{ash::vk, foreign_acquire, foreign_release};
             let Some(src) = gpu.imported.get(index) else {
                 error!("webcam: frame index {index} has no imported texture");
                 capture.requeue(frame.index);
@@ -640,23 +645,27 @@ fn upload_one(
                 label: Some("webcam dmabuf copy"),
             });
             let layout_vk = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-            if !shared.no_barrier {
-                record_foreign_acquire(&mut encoder, device.wgpu_device(), src, layout_vk);
-            }
+            // Barriers live in their own command buffers: wgpu forbids raw Vulkan recording on
+            // an encoder that also takes wgpu commands.
+            let (acquire, release) = if shared.no_barrier {
+                (None, None)
+            } else {
+                (
+                    foreign_acquire(device.wgpu_device(), src, layout_vk),
+                    foreign_release(device.wgpu_device(), src, layout_vk),
+                )
+            };
             encoder.copy_texture_to_texture(
                 src.as_image_copy(),
                 gpu_image.texture.as_image_copy(),
                 size,
             );
-            if !shared.no_barrier {
-                record_foreign_release(&mut encoder, device.wgpu_device(), src, layout_vk);
-            }
             if gpu.verified < shared.verify_frames {
                 gpu.verified += 1;
                 verify_copy(
                     device,
                     queue,
-                    encoder,
+                    (acquire, encoder, release),
                     &gpu_image.texture,
                     size,
                     shared,
@@ -664,7 +673,11 @@ fn upload_one(
                 );
                 capture.requeue(frame.index);
             } else {
-                queue.submit([encoder.finish()]);
+                queue.submit(
+                    [acquire, Some(encoder.finish()), release]
+                        .into_iter()
+                        .flatten(),
+                );
                 // Hand the buffer back only once the GPU has finished reading it.
                 let capture = Arc::clone(capture);
                 queue.on_submitted_work_done(move || capture.requeue(frame.index));
@@ -786,7 +799,11 @@ fn import_all(
 fn verify_copy(
     device: &RenderDevice,
     queue: &RenderQueue,
-    mut encoder: wgpu::CommandEncoder,
+    (acquire, mut encoder, release): (
+        Option<wgpu::CommandBuffer>,
+        wgpu::CommandEncoder,
+        Option<wgpu::CommandBuffer>,
+    ),
     dst: &wgpu::Texture,
     size: Extent3d,
     shared: &WebcamFeed,
@@ -817,7 +834,11 @@ fn verify_copy(
         },
         size,
     );
-    queue.submit([encoder.finish()]);
+    queue.submit(
+        [acquire, Some(encoder.finish()), release]
+            .into_iter()
+            .flatten(),
+    );
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if let Err(e) = device

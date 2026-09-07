@@ -398,7 +398,12 @@ pub fn import_dmabuf_texture(
             raw_for_drop.destroy_image(image, None);
             raw_for_drop.free_memory(memory, None);
         });
-        hal_device.texture_from_raw(image, &hal_desc, Some(drop_callback))
+        hal_device.texture_from_raw(
+            image,
+            &hal_desc,
+            Some(drop_callback),
+            wgpu::hal::vulkan::TextureMemory::External,
+        )
     };
 
     // SAFETY: `hal_texture` was created respecting this descriptor.
@@ -510,54 +515,54 @@ unsafe fn check_importable(
     }
 }
 
-/// Records the barrier that makes writes by a non-Vulkan producer (a kernel driver DMA-ing or
-/// memcpy-ing into the DMA-BUF) visible to a following transfer or shader read of `texture`.
+/// Builds a command buffer holding the barrier that makes writes by a non-Vulkan producer (a
+/// kernel driver DMA-ing or memcpy-ing into the DMA-BUF) visible to a following transfer or
+/// shader read of `texture`.
 ///
 /// wgpu tracks the imported image as plain device memory and inserts no barrier once the image
 /// has been used, so without this the GPU may read stale lines from its own caches. Vulkan
 /// specifies the fix as a queue-family ownership *acquire* from `VK_QUEUE_FAMILY_FOREIGN_EXT`
-/// (plus host-write visibility). Call it on an encoder before the command that reads the image;
-/// wgpu must already consider the image to be in `COPY_SRC` state (the first use is handled by
-/// wgpu's own transition, which runs before this encoder).
+/// (plus host-write visibility). Submit the returned buffer immediately before the one that
+/// reads the image; wgpu must already consider the image to be in the state matching `layout`
+/// (the first use is handled by wgpu's own transition, which precedes every submission).
+///
+/// It lives in its own command buffer because wgpu does not allow raw Vulkan recording on an
+/// encoder that also records wgpu commands. Returns `None` when the backend is not Vulkan.
 ///
 /// `layout` must be the Vulkan layout wgpu keeps the image in for the use that follows:
 /// `TRANSFER_SRC_OPTIMAL` for `copy_texture_to_texture`, `SHADER_READ_ONLY_OPTIMAL` for sampling.
-pub fn record_foreign_acquire(
-    encoder: &mut wgpu::CommandEncoder,
+///
+/// Note: in practice the CPU-side cache write-back in `Capture` is what fixes coherence on
+/// x86 with NVIDIA; this barrier is kept because the specification requires it.
+pub fn foreign_acquire(
     device: &wgpu::Device,
     texture: &wgpu::Texture,
     layout: vk::ImageLayout,
-) {
-    record_ownership_barrier(encoder, device, texture, layout, true);
+) -> Option<wgpu::CommandBuffer> {
+    ownership_barrier(device, texture, layout, true)
 }
 
-/// The matching *release* back to the foreign queue family, recorded after the last read of the
+/// The matching *release* back to the foreign queue family, to submit after the last read of the
 /// frame. Keeps the acquire/release pairs balanced as the spec requires.
-pub fn record_foreign_release(
-    encoder: &mut wgpu::CommandEncoder,
+pub fn foreign_release(
     device: &wgpu::Device,
     texture: &wgpu::Texture,
     layout: vk::ImageLayout,
-) {
-    record_ownership_barrier(encoder, device, texture, layout, false);
+) -> Option<wgpu::CommandBuffer> {
+    ownership_barrier(device, texture, layout, false)
 }
 
-fn record_ownership_barrier(
-    encoder: &mut wgpu::CommandEncoder,
+fn ownership_barrier(
     device: &wgpu::Device,
     texture: &wgpu::Texture,
     layout: vk::ImageLayout,
     acquire: bool,
-) {
-    // SAFETY: we only record a barrier on wgpu's active command buffer, on an image wgpu owns,
-    // without changing its layout.
+) -> Option<wgpu::CommandBuffer> {
+    // SAFETY: we only record barriers on a fresh command buffer, on an image wgpu owns, without
+    // changing its layout.
     unsafe {
-        let Some(hal_device) = device.as_hal::<Vulkan>() else {
-            return;
-        };
-        let Some(hal_texture) = texture.as_hal::<Vulkan>() else {
-            return;
-        };
+        let hal_device = device.as_hal::<Vulkan>()?;
+        let hal_texture = texture.as_hal::<Vulkan>()?;
         let image = hal_texture.raw_handle();
         let family = hal_device.queue_family_index();
         let raw = hal_device.raw_device().clone();
@@ -567,9 +572,16 @@ fn record_ownership_barrier(
         drop(hal_texture);
         drop(hal_device);
 
-        encoder.as_hal_mut::<Vulkan, _, _>(|hal_encoder| {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some(if acquire {
+                "dmabuf foreign acquire"
+            } else {
+                "dmabuf foreign release"
+            }),
+        });
+        let recorded = encoder.as_hal_mut::<Vulkan, _, _>(|hal_encoder| {
             let Some(hal_encoder) = hal_encoder else {
-                return;
+                return false;
             };
             let cb = hal_encoder.raw_handle();
             let read_access = vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::SHADER_READ;
@@ -599,8 +611,7 @@ fn record_ownership_barrier(
                     &[],
                     &[],
                 );
-                // 2. Ownership acquire from the foreign (non-Vulkan) producer, which is what
-                //    invalidates the GPU's caches for this image.
+                // 2. Ownership acquire from the foreign (non-Vulkan) producer.
                 if has_foreign {
                     let take = vk::ImageMemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::empty())
@@ -641,6 +652,8 @@ fn record_ownership_barrier(
                     &[give],
                 );
             }
+            true
         });
+        recorded.then(|| encoder.finish())
     }
 }
